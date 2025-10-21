@@ -7,78 +7,13 @@ from pathlib import Path
 # local modules
 from time_tracker import tracker
 from time_tracker.screenshot_manager import ScreenshotManager
-
-DEFAULT_SETTINGS = {
-    "autoscreen_enabled": True,
-    "autoscreen_interval": 15  # минут
-}
-
-FILE = "tasks.json"
-SETTINGS_FILE = "settings.json"
-TIME_LOG = "time_log.json"
-SCREENSHOT_BASE = "screenshots"
-
-def load_tasks():
-    if os.path.exists(FILE):
-        with open(FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
-
-def save_tasks(tasks):
-    with open(FILE, "w", encoding="utf-8") as f:
-        json.dump(tasks, f, ensure_ascii=False, indent=2)
-
-def mask_date_entry(entry: tk.Entry):
-    def on_validate(action, index, value_if_allowed, prior_value, text, validation_type, trigger_type, widget_name):
-        if action == "1":
-            if not text.isdigit():
-                return False
-            if len(value_if_allowed) in (2, 5) and not value_if_allowed.endswith('.'):
-                def _insert():
-                    cur = entry.get()
-                    if len(cur) == 2 or len(cur) == 5:
-                        entry.delete(0, tk.END)
-                        entry.insert(0, cur + '.')
-                entry.after(1, _insert)
-        return len(value_if_allowed) <= 10
-    vcmd = (entry.register(on_validate), "%d", "%i", "%P", "%s", "%S", "%v", "%V", "%W")
-    entry.config(validate="key", validatecommand=vcmd)
-
-def mask_time_entry(entry: tk.Entry):
-    def on_validate(P):
-        if len(P) > 5:
-            return False
-        for ch in P:
-            if not (ch.isdigit() or ch == ':'):
-                return False
-        if len(P) == 2 and ':' not in P:
-            def _insert_colon():
-                cur = entry.get()
-                if len(cur) == 2 and ':' not in cur:
-                    entry.delete(0, tk.END)
-                    entry.insert(0, cur + ":")
-            entry.after(1, _insert_colon)
-        return True
-    vcmd = (entry.register(on_validate), "%P")
-    entry.config(validate="key", validatecommand=vcmd)
-
-def load_settings():
-    if os.path.exists(SETTINGS_FILE):
-        try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                return {**DEFAULT_SETTINGS, **json.load(f)}
-        except Exception:
-            pass
-    return DEFAULT_SETTINGS.copy()
-
-def save_settings(data):
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def seconds_to_hms(sec):
-    h, rem = divmod(int(sec), 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:02}:{m:02}:{s:02}"
+from utils import (
+    load_tasks, save_tasks,
+    mask_date_entry, mask_time_entry,
+    load_settings, save_settings,
+    seconds_to_hms, DEFAULT_SETTINGS,
+    SCREENSHOT_BASE
+)
 
 # Toast (auto-size to show full text)
 class Toast:
@@ -131,6 +66,14 @@ class TodoApp:
         self.settings = load_settings()
         self.timer_running = False
         self.current_task_id = None
+
+        # --- AUTOSAVE state ---
+        # timestamp ISO string of the start of current activity (used to reliably find the record)
+        self.current_log_start = None
+        self.autosave_thread = None
+        self.stop_autosave_flag = threading.Event()
+        # autosave interval seconds (5 minutes)
+        self.AUTO_SAVE_INTERVAL = 300
 
         # Screenshot manager (providing a callback to get current project)
         def _get_project_for_screenshot():
@@ -349,27 +292,129 @@ class TodoApp:
         task = next((t for t in self.tasks if t["id"] == self.current_task_id), None)
         if task: self.current_task_label.config(text=f"— {task['text']}")
         self.highlight_current_task()
-        Toast(self.root, "Таймер запущен")
 
-    def stop_timer(self):
-        if not self.timer_running: return
-        self.timer_running = False
-        self.btn_start.config(state="normal"); self.btn_stop.config(state="disabled")
-        end_time = time.time(); elapsed = end_time - self.timer_start
-        task = next((t for t in self.tasks if t["id"] == self.current_task_id), None)
+        # create initial record (end = current, duration_seconds = 0)
         entry = {
             "task_id": self.current_task_id,
             "task_text": task.get("text","") if task else "",
             "project": task.get("project","") if task else "",
             "section": task.get("section","") if task else "",
             "start": datetime.datetime.fromtimestamp(self.timer_start).isoformat(),
-            "end": datetime.datetime.fromtimestamp(end_time).isoformat(),
-            "duration_seconds": int(elapsed)
+            "end": datetime.datetime.fromtimestamp(self.timer_start).isoformat(),
+            "duration_seconds": 0
         }
-        tracker.append_time_log(entry)   # use tracker module for log writes
+        # store start iso to reliably find this record later
+        self.current_log_start = entry["start"]
+        try:
+            data = tracker.load_time_log()
+            data.append(entry)
+            # write file directly (tracker.append_time_log would also append but we want single write)
+            with open(tracker.TIME_LOG, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            # best-effort: attempt to append via tracker.append_time_log
+            try:
+                tracker.append_time_log(entry)
+            except Exception:
+                pass
+
+        # start autosave thread (daemon)
+        self.stop_autosave_flag.clear()
+        self.autosave_thread = threading.Thread(target=self._autosave_loop, daemon=True)
+        self.autosave_thread.start()
+
+        Toast(self.root, "Таймер запущен")
+
+    def _autosave_loop(self):
+        # loop with wait so stop flag can interrupt immediately
+        while not self.stop_autosave_flag.wait(self.AUTO_SAVE_INTERVAL):
+            if not self.timer_running:
+                continue
+            # silent update (no notifications)
+            try:
+                self._update_current_log_entry(allow_append=False)
+            except Exception:
+                # swallow errors silently
+                pass
+
+    def _update_current_log_entry(self, allow_append=False):
+        """
+        Update the current activity record's 'end' and 'duration_seconds'.
+        If allow_append==True and matching record not found, append a final record.
+        """
+        if not self.current_task_id or not self.current_log_start:
+            return
+        try:
+            data = tracker.load_time_log()
+            found = False
+            for rec in data:
+                # match by task_id + start timestamp (exact string)
+                if rec.get("task_id") == self.current_task_id and rec.get("start") == self.current_log_start:
+                    now = datetime.datetime.now()
+                    duration = int(now.timestamp() - self.timer_start)
+                    rec["end"] = now.isoformat()
+                    rec["duration_seconds"] = duration
+                    found = True
+                    break
+            if found:
+                with open(tracker.TIME_LOG, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            else:
+                if allow_append:
+                    # fallback: append a final record
+                    now = datetime.datetime.now()
+                    duration = int(now.timestamp() - self.timer_start)
+                    fallback = {
+                        "task_id": self.current_task_id,
+                        "task_text": next((t.get("text","") for t in self.tasks if t["id"]==self.current_task_id), ""),
+                        "project": next((t.get("project","") for t in self.tasks if t["id"]==self.current_task_id), ""),
+                        "section": next((t.get("section","") for t in self.tasks if t["id"]==self.current_task_id), ""),
+                        "start": self.current_log_start,
+                        "end": now.isoformat(),
+                        "duration_seconds": duration
+                    }
+                    data.append(fallback)
+                    with open(tracker.TIME_LOG, "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            # silent ignore to avoid disturbing the UI
+            pass
+
+    def stop_timer(self):
+        if not self.timer_running: return
+        self.timer_running = False
+        self.btn_start.config(state="normal"); self.btn_stop.config(state="disabled")
+        end_time = time.time(); elapsed = end_time - self.timer_start
+
+        # stop autosave loop
+        self.stop_autosave_flag.set()
+        # final update: allow append if record not found
+        try:
+            self._update_current_log_entry(allow_append=True)
+        except Exception:
+            # if update failed entirely, fallback to append exactly as before
+            try:
+                task = next((t for t in self.tasks if t["id"] == self.current_task_id), None)
+                entry = {
+                    "task_id": self.current_task_id,
+                    "task_text": task.get("text","") if task else "",
+                    "project": task.get("project","") if task else "",
+                    "section": task.get("section","") if task else "",
+                    "start": datetime.datetime.fromtimestamp(self.timer_start).isoformat(),
+                    "end": datetime.datetime.fromtimestamp(end_time).isoformat(),
+                    "duration_seconds": int(elapsed)
+                }
+                tracker.append_time_log(entry)
+            except Exception:
+                pass
+
         self.screenshot_mgr.stop_autoscreen()
         Toast(self.root, f"Таймер остановлен ({seconds_to_hms(elapsed)})")
-        self.remove_highlight(); self.current_task_id = None; self.refresh()
+        # clear state and UI highlight
+        self.remove_highlight()
+        self.current_task_id = None
+        self.current_log_start = None
+        self.refresh()
 
     def highlight_current_task(self):
         self.remove_highlight()

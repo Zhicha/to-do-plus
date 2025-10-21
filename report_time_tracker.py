@@ -14,11 +14,20 @@ def load_time_log():
                 return []
     return []
 
+def save_time_log(data):
+    with open(TIME_LOG, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
 def seconds_to_hms(s: int) -> str:
     h = s // 3600
     m = (s % 3600) // 60
     sec = s % 60
     return f"{h}:{m:02d}:{sec:02d}"
+
+def seconds_to_hm(s: int) -> str:
+    h = s // 3600
+    m = (s % 3600) // 60
+    return f"{h:02d}:{m:02d}"
 
 class ReportApp:
     def __init__(self, root):
@@ -66,6 +75,7 @@ class ReportApp:
             self.tree.heading(c, text=h)
             self.tree.column(c, width=150 if c != "task_text" else 300)
         self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<Double-1>", self.on_edit_entry)
 
         right = ttk.Frame(main, width=300)
         right.pack(side="right", fill="y")
@@ -149,6 +159,20 @@ class ReportApp:
                 })
         return out
 
+    def on_edit_entry(self, event):
+        # определяем строку по координате клика (надёжнее чем focus)
+        item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            return
+        try:
+            index = int(item_id)
+        except Exception:
+            return
+
+        raw = load_time_log()
+        if 0 <= index < len(raw):
+            EditEntryWindow(self, index, raw[index])
+
     def update(self, mode=None):
         raw = load_time_log()
         entries = self._normalize_entries(raw)
@@ -186,7 +210,8 @@ class ReportApp:
 
         self.tree.delete(*self.tree.get_children())
         for e in filtered:
-            self.tree.insert("", "end", values=(
+            # используем orig_index как iid — потом по нему найдём запись в исходном JSON
+            self.tree.insert("", "end", iid=str(e["orig_index"]), values=(
                 e["task_text"], e["project"], e["section"],
                 e["start"].strftime("%Y-%m-%d %H:%M:%S"),
                 e["end"].strftime("%Y-%m-%d %H:%M:%S"),
@@ -195,7 +220,6 @@ class ReportApp:
 
         self.lbl_total.config(text=f"Итого: {seconds_to_hms(total_seconds)}")
 
-        # summaries
         proj, task = {}, {}
         for e in filtered:
             proj[e["project"]] = proj.get(e["project"], 0) + e["duration_seconds"]
@@ -209,7 +233,6 @@ class ReportApp:
         for t, secs in sorted(task.items(), key=lambda x: -x[1]):
             self.tree_task.insert("", "end", values=(t, seconds_to_hms(secs)))
 
-        # additional grouped summary at bottom
         self.tree_summary.delete(*self.tree_summary.get_children())
 
         if grouping == "by_day":
@@ -228,6 +251,83 @@ class ReportApp:
                 weeks[key] = weeks.get(key, 0) + e["duration_seconds"]
             for w, s in sorted(weeks.items()):
                 self.tree_summary.insert("", "end", values=(w, seconds_to_hms(s)))
+
+class EditEntryWindow(tk.Toplevel):
+    def __init__(self, parent, index, entry):
+        super().__init__(parent.root)
+        self.parent = parent
+        self.index = index
+        self.entry = entry
+        self.title("Редактирование записи")
+        self.geometry("400x250")
+        self.resizable(False, False)
+
+        ttk.Label(self, text="Задача:").pack(anchor="w", padx=10, pady=(10,0))
+        self.ent_task = ttk.Entry(self, width=50)
+        self.ent_task.insert(0, entry.get("task_text", ""))
+        self.ent_task.config(state="readonly")
+        self.ent_task.pack(padx=10, pady=2)
+
+        ttk.Label(self, text="Начало (ISO):").pack(anchor="w", padx=10)
+        self.ent_start = ttk.Entry(self, width=50)
+        self.ent_start.insert(0, entry.get("start", ""))
+        self.ent_start.pack(padx=10, pady=2)
+        self.ent_start.bind("<KeyRelease>", self.on_time_change)
+
+        ttk.Label(self, text="Конец (ISO):").pack(anchor="w", padx=10)
+        self.ent_end = ttk.Entry(self, width=50)
+        self.ent_end.insert(0, entry.get("end", ""))
+        self.ent_end.pack(padx=10, pady=2)
+        self.ent_end.bind("<KeyRelease>", self.on_time_change)
+
+        ttk.Label(self, text="Длительность (чч:мм):").pack(anchor="w", padx=10)
+        self.lbl_dur = ttk.Label(self, text=seconds_to_hm(entry.get("duration_seconds", 0)))
+        self.lbl_dur.pack(anchor="w", padx=10, pady=2)
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="Сохранить", command=self.save).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Удалить", command=self.delete).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Отмена", command=self.destroy).pack(side="left", padx=5)
+
+    def on_time_change(self, event=None):
+        try:
+            start = datetime.datetime.fromisoformat(self.ent_start.get())
+            end = datetime.datetime.fromisoformat(self.ent_end.get())
+            diff = max(0, int((end - start).total_seconds()))
+            self.lbl_dur.config(text=seconds_to_hm(diff))
+        except Exception:
+            self.lbl_dur.config(text="--:--")
+
+    def save(self):
+        try:
+            start = datetime.datetime.fromisoformat(self.ent_start.get())
+            end = datetime.datetime.fromisoformat(self.ent_end.get())
+            duration = max(0, int((end - start).total_seconds()))
+        except Exception:
+            messagebox.showerror("Ошибка", "Неверный формат даты (используй ISO: YYYY-MM-DDTHH:MM:SS)")
+            return
+
+        data = load_time_log()
+        if 0 <= self.index < len(data):
+            data[self.index]["start"] = start.isoformat()
+            data[self.index]["end"] = end.isoformat()
+            data[self.index]["duration_seconds"] = duration
+            save_time_log(data)
+            self.parent.update()
+            self.destroy()
+            messagebox.showinfo("Сохранено", "Изменения сохранены.")
+
+    def delete(self):
+        if not messagebox.askyesno("Удаление", "Удалить эту запись?"):
+            return
+        data = load_time_log()
+        if 0 <= self.index < len(data):
+            del data[self.index]
+            save_time_log(data)
+        self.parent.update()
+        self.destroy()
+        messagebox.showinfo("Удалено", "Запись удалена.")
 
 if __name__ == "__main__":
     root = tk.Tk()
